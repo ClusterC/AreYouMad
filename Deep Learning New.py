@@ -1,17 +1,10 @@
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import torch
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from sklearn.model_selection import train_test_split # เพิ่มเข้ามา
 
-# โหลดโมเดลที่เทรนสำหรับภาษาไทย
-MODEL_NAME = "airesearch/wangchanberta-base-att-spm-uncased"  # หรือใช้ "xlm-roberta-base"
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-#model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=4)  # 4 อารมณ์ Moved inside EmotionClassifier
-
-# ตัวอย่างข้อความที่ติด Label แล้ว
-labels = {"น้อยใจ": 0, "งอน": 1, "ประชด": 2, "ปกติ": 3}
-
+# --- (ส่วนข้อมูล data และ labels เหมือนเดิม) ---
 data = [
     # ----------------------- น้อยใจ -----------------------
     ("ฉันไม่สำคัญหรอก", "น้อยใจ"),
@@ -187,18 +180,30 @@ data = [
     ("ถ้ามีไข่มุกเพิ่มจะหายโกรธเลย", "ประชด"),
     ("เอ้า! ได้เลย ไข่มุกสองเท่าก็ยอม", "ปกติ")
 ]
+labels = {"น้อยใจ": 0, "งอน": 1, "ประชด": 2, "ปกติ": 3}
+# -------------------------------------------
 
+MODEL_NAME = "airesearch/wangchanberta-base-att-spm-uncased"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# แปลงเป็น Tensor
+# เตรียมข้อมูล
 texts = [d[0] for d in data]
-label_ids = [labels[d[1]] for d in data]
+label_names = [d[1] for d in data]
+label_ids = [labels[name] for name in label_names]
 
-# Tokenize
-encodings = tokenizer(texts, truncation=True, padding=True, return_tensors="pt")
-labels_tensor = torch.tensor(label_ids)
+# 1. แบ่งข้อมูลเป็น Training และ Validation Sets (เช่น 80% train, 20% validation)
+train_texts, val_texts, train_labels, val_labels = train_test_split(
+    texts, label_ids, test_size=0.2, random_state=42, stratify=label_ids # stratify ช่วยให้สัดส่วน label ใกล้เคียงกัน
+)
 
+# 2. Tokenize แยกกันสำหรับ Train และ Validation
+train_encodings = tokenizer(train_texts, truncation=True, padding=True, return_tensors="pt")
+val_encodings = tokenizer(val_texts, truncation=True, padding=True, return_tensors="pt")
 
-# สร้าง Dataset สำหรับ PyTorch
+train_labels_tensor = torch.tensor(train_labels)
+val_labels_tensor = torch.tensor(val_labels)
+
+# 3. สร้าง Dataset และ DataLoader แยกกัน
 class EmotionDataset(Dataset):
     def __init__(self, encodings, labels):
         self.encodings = encodings
@@ -208,57 +213,112 @@ class EmotionDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        item = {key: val[idx] for key, val in self.encodings.items()}
-        item["labels"] = self.labels[idx]
+        # Ensure all tensor values are retrieved for the specific index
+        item = {key: val[idx].clone().detach() for key, val in self.encodings.items()}
+        item["labels"] = self.labels[idx].clone().detach()
         return item
 
+train_dataset = EmotionDataset(train_encodings, train_labels_tensor)
+val_dataset = EmotionDataset(val_encodings, val_labels_tensor)
 
-dataset = EmotionDataset(encodings, labels_tensor)
-dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+# ปรับ Batch Size ตามความเหมาะสมและหน่วยความจำที่มี
+train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=8) # Validation ไม่ต้อง shuffle
 
-
-# โมเดล Fine-Tune
+# 4. ปรับโมเดลใน PyTorch Lightning ให้มี validation_step
 class EmotionClassifier(pl.LightningModule):
-    def __init__(self, model_name):
+    def __init__(self, model_name, learning_rate=5e-5): # เพิ่ม learning_rate เป็น argument
         super().__init__()
+        self.save_hyperparameters() # บันทึก hyperparameters เช่น learning_rate
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name, num_labels=4
+            model_name, num_labels=len(labels) # ใช้ len(labels) เพื่อความยืดหยุ่น
         )
 
-    def training_step(self, batch, batch_idx):
-        outputs = self.model(**batch)
-        loss = outputs.loss
-        return loss
-
-    def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=5e-5)
-    
-    def forward(self, input_ids, attention_mask):
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+    def forward(self, input_ids, attention_mask, labels=None):
+         # Pass labels to the model if available (during training/validation)
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
+    def training_step(self, batch, batch_idx):
+        outputs = self(**batch) # Pass the whole batch dictionary
+        loss = outputs.loss
+        self.log('train_loss', loss) # Log training loss
+        return loss
 
-model = EmotionClassifier(MODEL_NAME)
+    # เพิ่ม validation_step
+    def validation_step(self, batch, batch_idx):
+        outputs = self(**batch) # Pass the whole batch dictionary
+        loss = outputs.loss
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=1)
+        # คำนวณ accuracy (ตัวอย่าง)
+        acc = (preds == batch['labels']).float().mean()
+        self.log('val_loss', loss, prog_bar=True) # Log validation loss
+        self.log('val_acc', acc, prog_bar=True)  # Log validation accuracy
+        return loss # หรือ return {'val_loss': loss, 'val_acc': acc}
 
-# เทรนโมเดล
-trainer = pl.Trainer(max_epochs=3, accelerator="auto")
-trainer.fit(model, dataloader)
+    def configure_optimizers(self):
+        # ใช้ learning_rate ที่รับเข้ามา
+        return torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
 
-model.model.save_pretrained('saved_model3')
-tokenizer.save_pretrained('saved_model3')
+# สร้างโมเดลและ Trainer
+model = EmotionClassifier(MODEL_NAME, learning_rate=5e-5) # สามารถเปลี่ยน learning rate ตรงนี้ได้ 1e-5, 3e-5, 1e-4 5e-5
 
-def predict(text):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-    #outputs = model(**inputs) # original bug line
-    outputs = model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
+# เพิ่ม Callback สำหรับ Early Stopping (ตัวอย่าง)
+from pytorch_lightning.callbacks import EarlyStopping
+
+early_stop_callback = EarlyStopping(
+   monitor='val_loss', # หรือ 'val_acc'
+   patience=3,         # จำนวน epochs ที่จะรอถ้า val_loss ไม่ลดลง
+   verbose=True,
+   mode='min'          # 'min' สำหรับ loss, 'max' สำหรับ accuracy
+)
+
+# เทรนโมเดล โดยใส่ val_dataloader และ callbacks เข้าไปด้วย
+trainer = pl.Trainer(
+    max_epochs=10, # เพิ่มจำนวน epochs ได้ เพราะมี early stopping ช่วย
+    accelerator="auto",
+    callbacks=[early_stop_callback] # เพิ่ม callback
+)
+trainer.fit(model, train_dataloader, val_dataloader) # ใส่ val_dataloader เข้าไป
+
+# --- (ส่วนการ Save และ Predict เหมือนเดิม แต่ควรใช้โมเดลที่ดีที่สุดจากการเทรน) ---
+
+# โหลดโมเดลที่ดีที่สุดที่ถูกบันทึกโดย Trainer (ถ้ามีการตั้งค่า checkpoint callback)
+# หรือใช้โมเดลสุดท้ายหลังจากการเทรน
+# model = EmotionClassifier.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
+# model.eval() # ตั้งเป็น evaluation mode
+
+# บันทึกโมเดลสุดท้ายหลังเทรนเสร็จ
+model_save_path = 'saved_model_best' # ตั้งชื่อ path ใหม่
+model.model.save_pretrained(model_save_path)
+tokenizer.save_pretrained(model_save_path)
+
+# ฟังก์ชัน Predict (ปรับปรุงเล็กน้อยให้ใช้ model ที่โหลดมา หรือ model สุดท้าย)
+loaded_tokenizer = AutoTokenizer.from_pretrained(model_save_path)
+loaded_model = AutoModelForSequenceClassification.from_pretrained(model_save_path)
+# ถ้าไม่ได้ใช้ PyTorch Lightning ต่อ หรือต้องการใช้แค่ model ของ Hugging Face
+# ให้สร้าง instance ของ EmotionClassifier ใหม่ แล้วโหลด state_dict หรือใช้ loaded_model โดยตรง
+
+def predict_hf(text, model_hf, tokenizer_hf):
+    inputs = tokenizer_hf(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad(): # ไม่ต้องคำนวณ gradient ตอน predict
+        outputs = model_hf(**inputs)
     probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-    return {
-        k: round(v.item() * 100, 2) for k, v in zip(labels.keys(), probs[0])
-    }
+    # สร้าง label map แบบกลับด้านเพื่อแสดงผล
+    id2label = {v: k for k, v in labels.items()}
+    # แสดงผลลัพธ์
+    results = {id2label[i]: round(prob.item() * 100, 2) for i, prob in enumerate(probs[0])}
+    # เรียงตาม probability
+    sorted_results = dict(sorted(results.items(), key=lambda item: item[1], reverse=True))
+    return sorted_results
 
 
-print(predict("เออ ดีมากเลยนะ"))
+print("--- Prediction ---")
+print(predict_hf("เออ ดีมากเลยนะ", loaded_model, loaded_tokenizer))
 print()
-print(predict("สวัสดีครับ"))
+print(predict_hf("สวัสดีครับ", loaded_model, loaded_tokenizer))
 print()
-print(predict("ทำไมเธอถึงไม่ตอบแชทฉันเลย ขอโทษนะ ฉันยุ่งอยู่จริงๆ อ๋อ งั้นก็ไม่เป็นไร ฉันคงไม่สำคัญอยู่แล้ว ไม่ใช่แบบนั้นนะ! วันนี้เธอลืมไปใช่ไหม ลืมอะไรเหรอ?"))
+# ข้อความยาวๆ อาจจะถูกตัด (truncate) หรือต้องจัดการ padding ให้เหมาะสม
+long_text = "ทำไมเธอถึงไม่ตอบแชทฉันเลย ขอโทษนะ ฉันยุ่งอยู่จริงๆ อ๋อ งั้นก็ไม่เป็นไร ฉันคงไม่สำคัญอยู่แล้ว ไม่ใช่แบบนั้นนะ! วันนี้เธอลืมไปใช่ไหม ลืมอะไรเหรอ?"
+print(predict_hf(long_text, loaded_model, loaded_tokenizer))
